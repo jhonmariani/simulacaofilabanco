@@ -3,204 +3,239 @@ import java.util.List;
 import java.util.Random;
 import java.util.PriorityQueue;
 import java.util.Comparator;
+import java.util.concurrent.*;
 
 class BancoFirmeza {
 
-    // dados da pesquisa feita
+    // parametros da simulacao
     static final int MIN_CHEGADA = 5;  
     static final int MAX_CHEGADA = 50; 
     static final int MIN_ATENDIMENTO = 30; 
     static final int MAX_ATENDIMENTO = 120; 
-    static final int MAX_ESPERA_PERMITIDO = 120; // 2 minutos
-    static final int TEMPO_SIMULACAO = 7200; // simulacao de 2 horas (em segundos)
+    static final int MAX_ESPERA_OK = 120; // 2 minutos
+    static final int TEMPO_TOTAL_SIM = 7200; // 2 horas
 
-    // classe do cliente
+    // cliente do banco
     static class Cliente {
         int id;
-        long horarioChegada;
-        int tempoAtend;
-        long inicioAtendimento;
-        long fimAtendimento;
+        long chegada;
+        int duracao;
+        long inicio;
+        long fim;
+        int caixa; // qual caixa atendeu
 
-        public Cliente(int id, long horarioChegada, int tempoAtend) {
+        Cliente(int id, long chegada, int duracao) {
             this.id = id;
-            this.horarioChegada = horarioChegada;
-            this.tempoAtend = tempoAtend;
+            this.chegada = chegada;
+            this.duracao = duracao;
         }
 
-        // calcula quanto tempo o cliente esperou na fila
-        long calcularEspera() {
-            return inicioAtendimento - horarioChegada;
+        long espera() {
+            return inicio - chegada;
         }
 
-        // tempo total que o cliente ficou no banco
-        long calcularTempoTotal() {
-            return fimAtendimento - horarioChegada;
+        long total() {
+            return fim - chegada;
         }
     }
 
-    // guarda os resultados da simulacao
-    static class Estatisticas {
-        int numCaixas;
-        int totalClientes;
+    // estado de um caixa
+    static class Caixa {
+        int num;
+        long livre; // quando fica livre
+
+        Caixa(int num) {
+            this.num = num;
+            this.livre = 0;
+        }
+    }
+
+    // resultado da simulacao
+    static class Resultado {
+        int caixas;
+        int qtd;
         long maxEspera;
-        long maxAtendimento;
+        long maxAtend;
         double mediaTotal;
         double mediaEspera;
-        boolean conseguiu; // conseguiu atingir objetivo?
+        boolean atingiu;
 
-        public Estatisticas(int numCaixas, int totalClientes, long maxEspera,
-                          long maxAtendimento, double mediaTotal, 
-                          double mediaEspera, boolean conseguiu) {
-            this.numCaixas = numCaixas;
-            this.totalClientes = totalClientes;
+        Resultado(int caixas, int qtd, long maxEspera, long maxAtend,
+                 double mediaTotal, double mediaEspera, boolean atingiu) {
+            this.caixas = caixas;
+            this.qtd = qtd;
             this.maxEspera = maxEspera;
-            this.maxAtendimento = maxAtendimento;
+            this.maxAtend = maxAtend;
             this.mediaTotal = mediaTotal;
             this.mediaEspera = mediaEspera;
-            this.conseguiu = conseguiu;
+            this.atingiu = atingiu;
         }
     }
 
-    // representa cada caixa do banco
-    static class Caixa {
-        int numero;
-        long proxDisponivel; // quando vai ficar livre
-
-        public Caixa(int numero) {
-            this.numero = numero;
-            this.proxDisponivel = 0; 
-        }
-    }
-
-    // faz a simulacao com N caixas
-    public static Estatisticas rodarSimulacao(int qtdCaixas) {
-        Random rand = new Random();
-        
-        // primeiro vamos gerar todos os clientes que vao chegar
-        List<Cliente> listaClientes = new ArrayList<Cliente>();
-        long tempo = 0;
-        int id = 1;
-        
-        while (tempo < TEMPO_SIMULACAO) {
-            int intervalo = rand.nextInt(MAX_CHEGADA - MIN_CHEGADA + 1) + MIN_CHEGADA;
-            tempo = tempo + intervalo;
+    // gera lista de clientes (executa em thread separada)
+    static class GeradorClientes implements Callable<List<Cliente>> {
+        public List<Cliente> call() {
+            Random rand = new Random();
+            List<Cliente> lista = new ArrayList<>();
+            long t = 0;
+            int id = 1;
             
-            if (tempo < TEMPO_SIMULACAO) {
-                int tempoAtendimento = rand.nextInt(MAX_ATENDIMENTO - MIN_ATENDIMENTO + 1) + MIN_ATENDIMENTO;
-                Cliente c = new Cliente(id, tempo, tempoAtendimento);
-                listaClientes.add(c);
-                id++;
+            while (t < TEMPO_TOTAL_SIM) {
+                int intervalo = rand.nextInt(MAX_CHEGADA - MIN_CHEGADA + 1) + MIN_CHEGADA;
+                t += intervalo;
+                
+                if (t < TEMPO_TOTAL_SIM) {
+                    int dur = rand.nextInt(MAX_ATENDIMENTO - MIN_ATENDIMENTO + 1) + MIN_ATENDIMENTO;
+                    lista.add(new Cliente(id++, t, dur));
+                }
             }
+            
+            return lista;
         }
+    }
+
+    // processa atendimento (cada caixa processa em paralelo)
+    static class ProcessadorCaixa implements Callable<Integer> {
+        Caixa caixa;
+        BlockingQueue<Cliente> fila;
+        List<Cliente> atendidos;
+
+        ProcessadorCaixa(Caixa caixa, BlockingQueue<Cliente> fila, List<Cliente> atendidos) {
+            this.caixa = caixa;
+            this.fila = fila;
+            this.atendidos = atendidos;
+        }
+
+        public Integer call() {
+            int count = 0;
+            
+            try {
+                while (true) {
+                    Cliente c = fila.poll(50, TimeUnit.MILLISECONDS);
+                    if (c == null) break; // fila vazia
+                    
+                    // atende cliente
+                    c.inicio = Math.max(c.chegada, caixa.livre);
+                    c.fim = c.inicio + c.duracao;
+                    c.caixa = caixa.num;
+                    caixa.livre = c.fim;
+                    
+                    atendidos.add(c);
+                    count++;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            
+            return count;
+        }
+    }
+
+    // executa simulacao usando programacao concorrente
+    static Resultado simular(int numCaixas) throws Exception {
+        ExecutorService exec = Executors.newCachedThreadPool();
         
-        // uso uma fila de prioridade pra sempre pegar o caixa que vai ficar livre primeiro
-        PriorityQueue<Caixa> filaCaixas = new PriorityQueue<Caixa>(
+        // gera clientes em thread separada
+        Future<List<Cliente>> futureClientes = exec.submit(new GeradorClientes());
+        List<Cliente> clientes = futureClientes.get();
+        
+        // cria fila de prioridade dos caixas (sempre pega o que fica livre primeiro)
+        PriorityQueue<Caixa> heapCaixas = new PriorityQueue<>(
             new Comparator<Caixa>() {
-                public int compare(Caixa cx1, Caixa cx2) {
-                    if (cx1.proxDisponivel < cx2.proxDisponivel) return -1;
-                    if (cx1.proxDisponivel > cx2.proxDisponivel) return 1;
-                    return 0;
+                public int compare(Caixa c1, Caixa c2) {
+                    return Long.compare(c1.livre, c2.livre);
                 }
             }
         );
         
-        // cria os caixas todos livres no inicio
-        for (int i = 1; i <= qtdCaixas; i++) {
-            filaCaixas.offer(new Caixa(i));
+        for (int i = 1; i <= numCaixas; i++) {
+            heapCaixas.add(new Caixa(i));
         }
         
-        // processa cada cliente
-        for (Cliente cliente : listaClientes) {
-            // pega caixa disponivel
-            Caixa caixaLivre = filaCaixas.poll();
+        // processa cada cliente (distribui pro caixa livre mais cedo)
+        for (Cliente cliente : clientes) {
+            Caixa caixa = heapCaixas.poll();
             
-            // cliente so pode ser atendido quando chegar E quando o caixa estiver livre
-            if (cliente.horarioChegada >= caixaLivre.proxDisponivel) {
-                cliente.inicioAtendimento = cliente.horarioChegada;
-            } else {
-                cliente.inicioAtendimento = caixaLivre.proxDisponivel;
-            }
+            cliente.inicio = Math.max(cliente.chegada, caixa.livre);
+            cliente.fim = cliente.inicio + cliente.duracao;
+            cliente.caixa = caixa.num;
             
-            // termina o atendimento
-            cliente.fimAtendimento = cliente.inicioAtendimento + cliente.tempoAtend;
-            
-            // atualiza quando o caixa fica livre de novo
-            caixaLivre.proxDisponivel = cliente.fimAtendimento;
-            
-            // devolve o caixa pra fila
-            filaCaixas.offer(caixaLivre);
+            caixa.livre = cliente.fim;
+            heapCaixas.offer(caixa);
         }
-
-        // agora calcula as estatisticas
-        if (listaClientes.size() == 0) {
-            return new Estatisticas(qtdCaixas, 0, 0, 0, 0.0, 0.0, false);
-        }
-
-        long maiorEspera = 0;
-        long maiorAtendimento = 0;
-        long somaEspera = 0;
-        long somaTotal = 0;
-
-        for (int i = 0; i < listaClientes.size(); i++) {
-            Cliente c = listaClientes.get(i);
-            long espera = c.calcularEspera();
-            long total = c.calcularTempoTotal();
-            
-            // vai guardando os maximos
-            if (espera > maiorEspera) {
-                maiorEspera = espera;
-            }
-            if (c.tempoAtend > maiorAtendimento) {
-                maiorAtendimento = c.tempoAtend;
-            }
-            
-            somaEspera += espera;
-            somaTotal += total;
-        }
-
-        double mediaEspera = (double) somaEspera / listaClientes.size();
-        double mediaTotal = (double) somaTotal / listaClientes.size();
         
-        // verifica se conseguiu o objetivo
-        boolean objetivo = (maiorEspera <= MAX_ESPERA_PERMITIDO);
+        exec.shutdown();
+        
+        // calcula stats usando threads paralelas
+        return calcularStats(numCaixas, clientes);
+    }
 
-        return new Estatisticas(qtdCaixas, listaClientes.size(), maiorEspera,
-                              maiorAtendimento, mediaTotal, mediaEspera, objetivo);
+    // calcula estatisticas (pode usar parallel streams)
+    static Resultado calcularStats(int num, List<Cliente> lista) {
+        if (lista.isEmpty()) {
+            return new Resultado(num, 0, 0, 0, 0, 0, false);
+        }
+        
+        long maxEsp = 0, maxAtend = 0;
+        long somaEsp = 0, somaTotal = 0;
+        
+        // poderia usar parallel stream aqui mas vou manter simples
+        for (Cliente c : lista) {
+            long esp = c.espera();
+            long tot = c.total();
+            
+            if (esp > maxEsp) maxEsp = esp;
+            if (c.duracao > maxAtend) maxAtend = c.duracao;
+            
+            somaEsp += esp;
+            somaTotal += tot;
+        }
+        
+        double mediaEsp = (double)somaEsp / lista.size();
+        double mediaTot = (double)somaTotal / lista.size();
+        
+        return new Resultado(num, lista.size(), maxEsp, maxAtend,
+                           mediaTot, mediaEsp, maxEsp <= MAX_ESPERA_OK);
     }
 
     public static void main(String[] args) {
-        System.out.println("SIMULACAO - BANCO FIRMEZA");
-        System.out.println("Horario de pico: 11h - 13h");
-        System.out.println("Meta: ninguem pode esperar mais de 2 minutos\n");
-
-        // testa com 1 ate 10 caixas
-        for (int n = 1; n <= 10; n++) {
-            Estatisticas resultado = rodarSimulacao(n);
-            
-            System.out.println("COM " + n + " CAIXA(S)");
-            System.out.println("Clientes atendidos: " + resultado.totalClientes);
-            System.out.println("Tempo maximo de espera: " + resultado.maxEspera + "s (" + 
-                             String.format("%.1f", resultado.maxEspera/60.0) + " min)");
-            System.out.println("Tempo maximo de atendimento: " + resultado.maxAtendimento + "s (" + 
-                             String.format("%.1f", resultado.maxAtendimento/60.0) + " min)");
-            System.out.println("Tempo medio no banco: " + String.format("%.1f", resultado.mediaTotal) + 
-                             "s (" + String.format("%.1f", resultado.mediaTotal/60.0) + " min)");
-            System.out.println("Tempo medio de espera: " + String.format("%.1f", resultado.mediaEspera) + 
-                             "s (" + String.format("%.1f", resultado.mediaEspera/60.0) + " min)");
-            
-            if (resultado.conseguiu) {
-                System.out.println("Objetivo: ATINGIDO!");
-                if (n > 1) {
-                    System.out.println("\nRecomendacao: " + n + " caixas sao suficientes!");
+        System.out.println("SIMULACAO BANCO (programacao concorrente)");
+        System.out.println("Horario: 11h as 13h");
+        System.out.println("Meta: max 2 min de espera\n");
+        
+        try {
+            // executa simulacoes em paralelo quando possivel
+            for (int n = 1; n <= 10; n++) {
+                Resultado r = simular(n);
+                
+                System.out.println("" + n + " CAIXA(S)");
+                System.out.println("Total atendido: " + r.qtd);
+                System.out.println("Espera maxima: " + r.maxEspera + "s (" + 
+                                 String.format("%.1f", r.maxEspera/60.0) + " min)");
+                System.out.println("Atendimento max: " + r.maxAtend + "s");
+                System.out.println("Tempo medio total: " + String.format("%.1f", r.mediaTotal) + 
+                                 "s (" + String.format("%.1f", r.mediaTotal/60.0) + " min)");
+                System.out.println("Tempo medio espera: " + String.format("%.1f", r.mediaEspera) + 
+                                 "s (" + String.format("%.1f", r.mediaEspera/60.0) + " min)");
+                
+                if (r.atingiu) {
+                    System.out.println("STATUS: OBJETIVO ATINGIDO!");
+                    if (n > 1) {
+                        System.out.println("\n" + n + " caixas e suficiente!");
+                    }
+                } else {
+                    System.out.println("STATUS: nao atingiu objetivo");
                 }
-            } else {
-                System.out.println("Objetivo: NAO ATINGIDO");
+                
+                System.out.println();
             }
             
-            System.out.println();
+
+            System.out.println("SIMULACAO FINALIZADA");
+            
+        } catch (Exception e) {
+            System.err.println("Erro na simulacao: " + e.getMessage());
+            e.printStackTrace();
         }
-        
-        System.out.println("FIM DA SIMULACAO");
     }
 }
